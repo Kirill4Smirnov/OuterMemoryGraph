@@ -37,7 +37,8 @@ sudo apt-get install -y \
   python3 \
   ca-certificates \
   wget \
-  gzip
+  gzip \
+  unzip
 
 cmake -S . -B build \
   -G Ninja \
@@ -169,11 +170,16 @@ python3 scripts/validate_output.py \
 
 Для проверки использовались `cit-Patents` и `soc-LiveJournal1` из коллекции SNAP
 
+Рабочие копии этих наборов есть на Kaggle
+
 ```bash
-wget https://snap.stanford.edu/data/cit-Patents.txt.gz
-wget https://snap.stanford.edu/data/soc-LiveJournal1.txt.gz
-gzip -dk cit-Patents.txt.gz
-gzip -dk soc-LiveJournal1.txt.gz
+wget -O cit-Patents.zip \
+  https://www.kaggle.com/api/v1/datasets/download/wolfram77/graph-snap-cit-patents
+wget -O soc-LiveJournal1.zip \
+  https://www.kaggle.com/api/v1/datasets/download/lohithkandibanda/soc-livejournal1-txt-gz
+
+unzip cit-Patents.zip cit-Patents.txt
+unzip soc-LiveJournal1.zip soc-LiveJournal1.txt
 ```
 
 Эти файлы и полученные из них графы не нужно добавлять в Git
@@ -197,7 +203,10 @@ docker run --rm --memory=128m --memory-swap=128m \
 
 ## Документация
 
+- [Отчёт по решению](docs/report.md)
 - [Алгоритм и оценки](docs/solution.md)
 - [Способ хранения и альтернативы](docs/alternatives.md)
 - [Проверка корректности и памяти](docs/verification.md)
 - [Форматы данных](docs/formats.md)
+- [Внутренний формат графа](docs/file-format.md)
+- [Устройство проекта](docs/project-guide.md)

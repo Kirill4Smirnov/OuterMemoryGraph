@@ -1,0 +1,8 @@
+build
+build-*
+graphs
+.cache
+.git
+cit-Patents.txt
+soc-LiveJournal1.txt
+*.csv
