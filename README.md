@@ -209,4 +209,3 @@ docker run --rm --memory=128m --memory-swap=128m \
 - [Проверка корректности и памяти](docs/verification.md)
 - [Форматы данных](docs/formats.md)
 - [Внутренний формат графа](docs/file-format.md)
-- [Устройство проекта](docs/project-guide.md)
