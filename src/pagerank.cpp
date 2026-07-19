@@ -134,16 +134,21 @@ auto load_raw_vector(const fs::path& path, const std::size_t count) -> std::vect
   return records;
 }
 
-auto required_runtime_bytes(const std::size_t vertices, const std::size_t workers)
-    -> std::uint64_t {
+auto required_runtime_bytes(const std::size_t vertices, const std::size_t workers,
+                            const std::size_t shards) -> std::uint64_t {
   const auto vertex_bytes =
       static_cast<std::uint64_t>(vertices) * (2U * sizeof(double) + sizeof(std::uint32_t));
-  const auto worker_bytes = static_cast<std::uint64_t>(workers) * kShardBufferBytes;
+  const auto worker_bytes =
+      static_cast<std::uint64_t>(workers) * (kShardBufferBytes + sizeof(std::jthread));
+  const auto shard_bytes = static_cast<std::uint64_t>(shards) *
+                           (sizeof(ShardMetadata) + sizeof(ShardIterationStats) + 64U);
   if (vertex_bytes >
-      std::numeric_limits<std::uint64_t>::max() - worker_bytes - kRuntimeReserveBytes) {
+          std::numeric_limits<std::uint64_t>::max() - worker_bytes - kRuntimeReserveBytes ||
+      vertex_bytes + worker_bytes >
+          std::numeric_limits<std::uint64_t>::max() - shard_bytes - kRuntimeReserveBytes) {
     throw std::runtime_error("PageRank memory estimate overflow");
   }
-  return vertex_bytes + worker_bytes + kRuntimeReserveBytes;
+  return vertex_bytes + worker_bytes + shard_bytes + kRuntimeReserveBytes;
 }
 
 auto dangling_sum(const std::vector<double>& ranks, const std::vector<std::uint32_t>& outdegrees)
@@ -173,6 +178,15 @@ auto process_shard(const fs::path& graph_directory, const ShardMetadata& shard,
 
   EdgeCount read_edges = 0;
   std::optional<DiskEdge> previous;
+  std::optional<DenseVertexId> accumulated_destination;
+  CompensatedSum incoming_sum;
+  const auto flush_incoming = [&]() {
+    if (accumulated_destination) {
+      const auto contribution = static_cast<long double>(damping) * incoming_sum.value();
+      next_ranks[*accumulated_destination] =
+          static_cast<double>(static_cast<long double>(base) + contribution);
+    }
+  };
   while (true) {
     input.read(reinterpret_cast<char*>(edge_buffer.data()),
                static_cast<std::streamsize>(edge_buffer.size() * sizeof(DiskEdge)));
@@ -203,11 +217,18 @@ auto process_shard(const fs::path& graph_directory, const ShardMetadata& shard,
       if (degree == 0) {
         throw std::runtime_error("edge source has zero outdegree in shard: " + shard.file);
       }
-      next_ranks[edge.destination] += damping * ranks[edge.source] / static_cast<double>(degree);
+      if (!accumulated_destination || *accumulated_destination != edge.destination) {
+        flush_incoming();
+        accumulated_destination = edge.destination;
+        incoming_sum = {};
+      }
+      incoming_sum.add(static_cast<long double>(ranks[edge.source]) /
+                       static_cast<long double>(degree));
       previous = edge;
       ++read_edges;
     }
   }
+  flush_incoming();
   if (read_edges != shard.edge_count) {
     throw std::runtime_error("shard edge count changed: " + shard.file);
   }
@@ -258,7 +279,7 @@ auto run_iteration(const fs::path& graph_directory, const GraphManifest& manifes
     }
   };
 
-  std::vector<std::thread> workers;
+  std::vector<std::jthread> workers;
   workers.reserve(worker_count);
   for (std::size_t index = 0; index < worker_count; ++index) {
     workers.emplace_back(worker);
@@ -355,7 +376,8 @@ auto run_pagerank(const PageRankOptions& options) -> PageRankResult {
   validate_graph_files(options.graph_directory, manifest);
   const auto vertex_count = checked_size(manifest.vertex_count);
   const auto worker_count = std::min(options.threads, manifest.shards.size());
-  const auto required_bytes = required_runtime_bytes(vertex_count, worker_count);
+  const auto required_bytes =
+      required_runtime_bytes(vertex_count, worker_count, manifest.shards.size());
   if (required_bytes > options.memory_budget_bytes) {
     throw std::runtime_error("PageRank requires approximately " +
                              std::to_string((required_bytes + kMiB - 1U) / kMiB) +

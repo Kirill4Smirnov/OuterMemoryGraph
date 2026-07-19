@@ -30,7 +30,7 @@ Usage:
 Preprocess options:
   --work-dir DIR       Temporary run directory (default: DIR.work)
   --memory-mb N        Memory budget in MiB (default: 128)
-  --threads N          CPU count used for shard planning (default: hardware concurrency)
+  --threads N          Run-sort workers and shard planning (default: hardware concurrency)
   --shards N           Requested destination shards (default: 4 * threads)
 
 PageRank options:

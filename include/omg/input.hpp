@@ -15,6 +15,10 @@ struct InputStats {
   EdgeCount edges{};
   std::uint64_t comments{};
   std::uint64_t headers{};
+  // FNV-1a over the parsed (source, destination) sequence. Comparing this
+  // value between preprocessing passes detects an input that changed while
+  // the graph was being built.
+  std::uint64_t edge_fingerprint{14695981039346656037ULL};
 };
 
 // Streaming reader for both the assignment CSV format and SNAP-style

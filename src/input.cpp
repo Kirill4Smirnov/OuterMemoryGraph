@@ -9,6 +9,21 @@
 namespace omg {
 namespace {
 
+constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+
+void fingerprint_integer(std::uint64_t& fingerprint, const OriginalVertexId value) noexcept {
+  const auto bits = static_cast<std::uint32_t>(value);
+  for (unsigned int shift = 0; shift < 32U; shift += 8U) {
+    fingerprint ^= (bits >> shift) & 0xffU;
+    fingerprint *= kFnvPrime;
+  }
+}
+
+void fingerprint_edge(std::uint64_t& fingerprint, const OriginalEdge& edge) noexcept {
+  fingerprint_integer(fingerprint, edge.source);
+  fingerprint_integer(fingerprint, edge.destination);
+}
+
 auto trim(std::string_view value) -> std::string_view {
   while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())) != 0) {
     value.remove_prefix(1);
@@ -93,6 +108,7 @@ auto EdgeListReader::next(OriginalEdge& edge) -> bool {
       continue;
     }
     if (parse_edge_line(line, edge)) {
+      fingerprint_edge(stats_.edge_fingerprint, edge);
       ++stats_.edges;
       return true;
     }

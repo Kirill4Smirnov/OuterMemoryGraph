@@ -3,18 +3,22 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -36,6 +40,9 @@ constexpr std::size_t kInputBufferBytes = 1U << 20U;
 constexpr std::size_t kRunBufferBytes = 64U << 10U;
 constexpr std::size_t kOutputBufferBytes = 1U << 20U;
 constexpr std::size_t kMergeFanIn = 64;
+constexpr std::size_t kMinimumSortPartitionBytes = 256U << 10U;
+constexpr std::size_t kMaximumSortWorkers = 64;
+constexpr std::uint64_t kMergeRuntimeReserveBytes = 8ULL << 20U;
 
 class ScopedDirectoryCleanup {
 public:
@@ -165,12 +172,17 @@ private:
 struct VertexRunResult {
   std::vector<fs::path> runs;
   EdgeCount input_edges{};
+  std::uint64_t input_fingerprint{};
+  std::size_t maximum_sort_workers{};
   OriginalVertexId minimum_id{};
   OriginalVertexId maximum_id{};
 };
 
 struct EdgeRunResult {
   std::vector<fs::path> runs;
+  EdgeCount input_edges{};
+  std::uint64_t input_fingerprint{};
+  std::size_t maximum_sort_workers{};
 };
 
 struct MergeResult {
@@ -246,6 +258,96 @@ void write_records(const fs::path& path, const std::vector<Record>& records) {
   }
 }
 
+template <typename Record, typename Less>
+auto sort_and_write_run(const fs::path& path, std::vector<Record>& records,
+                        const std::size_t requested_threads, Less less) -> std::size_t {
+  if (records.empty()) {
+    throw std::invalid_argument("cannot create an empty sorted run");
+  }
+
+  const auto minimum_partition_records =
+      std::max<std::size_t>(1, kMinimumSortPartitionBytes / sizeof(Record));
+  const auto useful_workers =
+      (records.size() + minimum_partition_records - 1U) / minimum_partition_records;
+  const auto worker_count =
+      std::min({requested_threads, useful_workers, kMaximumSortWorkers, records.size()});
+
+  std::vector<std::size_t> partition_begins(worker_count);
+  std::vector<std::size_t> unique_ends(worker_count);
+  std::exception_ptr failure;
+  std::mutex failure_mutex;
+
+  auto sort_partition = [&](const std::size_t partition) {
+    try {
+      const auto begin = partition * records.size() / worker_count;
+      const auto end = (partition + 1U) * records.size() / worker_count;
+      partition_begins[partition] = begin;
+      auto first = records.begin() + static_cast<std::ptrdiff_t>(begin);
+      const auto last = records.begin() + static_cast<std::ptrdiff_t>(end);
+      std::sort(first, last, less);
+      unique_ends[partition] = static_cast<std::size_t>(std::unique(first, last) - records.begin());
+    } catch (...) {
+      std::lock_guard lock(failure_mutex);
+      if (!failure) {
+        failure = std::current_exception();
+      }
+    }
+  };
+
+  std::vector<std::jthread> workers;
+  workers.reserve(worker_count);
+  for (std::size_t partition = 0; partition < worker_count; ++partition) {
+    workers.emplace_back(sort_partition, partition);
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
+
+  struct PartitionHead {
+    std::size_t partition{};
+    std::size_t position{};
+  };
+  const auto head_greater = [&](const PartitionHead& left, const PartitionHead& right) {
+    const auto& left_record = records[left.position];
+    const auto& right_record = records[right.position];
+    if (less(right_record, left_record)) {
+      return true;
+    }
+    if (less(left_record, right_record)) {
+      return false;
+    }
+    return left.partition > right.partition;
+  };
+  std::priority_queue<PartitionHead, std::vector<PartitionHead>, decltype(head_greater)> heap(
+      head_greater);
+  for (std::size_t partition = 0; partition < worker_count; ++partition) {
+    if (partition_begins[partition] < unique_ends[partition]) {
+      heap.push({partition, partition_begins[partition]});
+    }
+  }
+
+  BufferedBinaryWriter<Record> output(path);
+  std::optional<Record> previous;
+  while (!heap.empty()) {
+    auto head = heap.top();
+    heap.pop();
+    const auto& record = records[head.position];
+    if (!previous || *previous != record) {
+      output.append(record);
+      previous = record;
+    }
+    ++head.position;
+    if (head.position < unique_ends[head.partition]) {
+      heap.push(head);
+    }
+  }
+  output.close();
+  return worker_count;
+}
+
 auto build_vertex_runs(const PreprocessOptions& options, const fs::path& session_directory)
     -> VertexRunResult {
   const auto working_bytes = working_memory_limit(options.memory_budget_bytes);
@@ -265,10 +367,10 @@ auto build_vertex_runs(const PreprocessOptions& options, const fs::path& session
     if (identifiers.empty()) {
       return;
     }
-    std::sort(identifiers.begin(), identifiers.end());
-    identifiers.erase(std::unique(identifiers.begin(), identifiers.end()), identifiers.end());
     const auto path = session_directory / run_name("vertices-run", result.runs.size());
-    write_records(path, identifiers);
+    result.maximum_sort_workers =
+        std::max(result.maximum_sort_workers, sort_and_write_run(path, identifiers, options.threads,
+                                                                 std::less<OriginalVertexId>{}));
     result.runs.push_back(path);
     identifiers.clear();
   };
@@ -292,6 +394,7 @@ auto build_vertex_runs(const PreprocessOptions& options, const fs::path& session
   }
   flush();
   result.input_edges = reader.stats().edges;
+  result.input_fingerprint = reader.stats().edge_fingerprint;
 
   if (!have_identifier || result.input_edges == 0) {
     throw std::invalid_argument("the input graph has no edges");
@@ -491,10 +594,10 @@ auto build_edge_runs(const PreprocessOptions& options, const fs::path& session_d
     if (edges.empty()) {
       return;
     }
-    std::sort(edges.begin(), edges.end(), disk_edge_less);
-    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
     const auto path = session_directory / run_name("edges-run", result.runs.size());
-    write_records(path, edges);
+    result.maximum_sort_workers =
+        std::max(result.maximum_sort_workers,
+                 sort_and_write_run(path, edges, options.threads, disk_edge_less));
     result.runs.push_back(path);
     edges.clear();
   };
@@ -508,6 +611,8 @@ auto build_edge_runs(const PreprocessOptions& options, const fs::path& session_d
     edges.push_back({mapper.map(edge.destination), mapper.map(edge.source)});
   }
   flush();
+  result.input_edges = reader.stats().edges;
+  result.input_fingerprint = reader.stats().edge_fingerprint;
   return result;
 }
 
@@ -678,6 +783,24 @@ void write_outdegrees(const fs::path& path, const std::vector<std::uint32_t>& ou
   write_records(path, outdegrees);
 }
 
+auto required_merge_bytes(const VertexCount vertex_count, const std::size_t run_count,
+                          const std::size_t requested_shards) -> std::uint64_t {
+  const auto outdegree_bytes = vertex_count * sizeof(std::uint32_t);
+  const auto reader_bytes = static_cast<std::uint64_t>(run_count) * kRunBufferBytes;
+  const auto possible_shards = std::min(static_cast<std::uint64_t>(requested_shards), vertex_count);
+  const auto shard_metadata_bytes = possible_shards * sizeof(ShardMetadata);
+  const auto fixed_bytes =
+      static_cast<std::uint64_t>(kOutputBufferBytes) + kMergeRuntimeReserveBytes;
+  if (outdegree_bytes > std::numeric_limits<std::uint64_t>::max() - reader_bytes ||
+      outdegree_bytes + reader_bytes >
+          std::numeric_limits<std::uint64_t>::max() - shard_metadata_bytes ||
+      outdegree_bytes + reader_bytes + shard_metadata_bytes >
+          std::numeric_limits<std::uint64_t>::max() - fixed_bytes) {
+    throw std::runtime_error("preprocessing merge memory estimate overflow");
+  }
+  return outdegree_bytes + reader_bytes + shard_metadata_bytes + fixed_bytes;
+}
+
 } // namespace
 
 void preprocess(const PreprocessOptions& options) {
@@ -711,6 +834,7 @@ void preprocess(const PreprocessOptions& options) {
   auto vertex_runs = build_vertex_runs(options, session_directory);
   std::cerr << "preprocess: vertex_runs=" << vertex_runs.runs.size()
             << " input_edges=" << vertex_runs.input_edges
+            << " sort_workers=" << vertex_runs.maximum_sort_workers
             << " seconds=" << elapsed_seconds(phase_start) << '\n';
 
   phase_start = Clock::now();
@@ -728,7 +852,12 @@ void preprocess(const PreprocessOptions& options) {
     edge_runs = build_edge_runs(options, session_directory, mapper,
                                 working_memory_limit(options.memory_budget_bytes));
   }
+  if (edge_runs.input_edges != vertex_runs.input_edges ||
+      edge_runs.input_fingerprint != vertex_runs.input_fingerprint) {
+    throw std::runtime_error("input edge list changed between preprocessing passes");
+  }
   std::cerr << "preprocess: edge_runs=" << edge_runs.runs.size()
+            << " sort_workers=" << edge_runs.maximum_sort_workers
             << " seconds=" << elapsed_seconds(phase_start) << '\n';
 
   phase_start = Clock::now();
@@ -736,9 +865,17 @@ void preprocess(const PreprocessOptions& options) {
   if (vertex_count > std::numeric_limits<std::size_t>::max()) {
     throw std::runtime_error("outdegree vector is too large for this host");
   }
+  const auto merge_memory =
+      required_merge_bytes(vertex_count, edge_runs.runs.size(), options.requested_shards);
+  if (merge_memory > options.memory_budget_bytes) {
+    throw std::runtime_error("preprocessing merge requires approximately " +
+                             std::to_string((merge_memory + kMiB - 1U) / kMiB) +
+                             " MiB, exceeding the configured budget");
+  }
+  std::cerr << "preprocess: phase=edge-merge estimated_memory_bytes=" << merge_memory << '\n';
   std::vector<std::uint32_t> outdegrees(static_cast<std::size_t>(vertex_count), 0);
-  const auto merge = merge_edge_runs(edge_runs.runs, staging_directory, vertex_count,
-                                     vertex_runs.input_edges, options.requested_shards, outdegrees);
+  auto merge = merge_edge_runs(edge_runs.runs, staging_directory, vertex_count,
+                               vertex_runs.input_edges, options.requested_shards, outdegrees);
   write_outdegrees(staging_directory / kOutdegreesFileName, outdegrees);
   outdegrees.clear();
   outdegrees.shrink_to_fit();
@@ -750,7 +887,7 @@ void preprocess(const PreprocessOptions& options) {
   manifest.edge_count = merge.edges;
   manifest.duplicate_edge_count = vertex_runs.input_edges - merge.edges;
   manifest.self_loop_count = merge.self_loops;
-  manifest.shards = merge.shards;
+  manifest.shards = std::move(merge.shards);
   save_manifest(staging_directory, manifest);
   validate_graph_files(staging_directory, manifest);
   std::cerr << "preprocess: unique_edges=" << manifest.edge_count

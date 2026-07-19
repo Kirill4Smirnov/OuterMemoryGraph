@@ -1,5 +1,6 @@
 #include "omg/manifest.hpp"
 
+#include <cstddef>
 #include <fstream>
 #include <stdexcept>
 
@@ -68,7 +69,31 @@ void save_manifest(const std::filesystem::path& graph_directory, const GraphMani
   if (!output) {
     throw std::runtime_error("cannot create manifest: " + path.string());
   }
-  output << Json(manifest).dump(2) << '\n';
+  // Stream the manifest instead of materializing both a JSON DOM and its
+  // serialized copy. Shard metadata can be large, so save must remain O(1)
+  // beyond the manifest already resident in memory.
+  output << "{\n"
+         << "  \"byte_order\": " << Json(manifest.byte_order).dump() << ",\n"
+         << "  \"duplicate_edge_count\": " << manifest.duplicate_edge_count << ",\n"
+         << "  \"edge_count\": " << manifest.edge_count << ",\n"
+         << "  \"format\": " << Json(manifest.format).dump() << ",\n"
+         << "  \"input_edge_count\": " << manifest.input_edge_count << ",\n"
+         << "  \"input_file\": " << Json(manifest.input_file).dump() << ",\n"
+         << "  \"self_loop_count\": " << manifest.self_loop_count << ",\n"
+         << "  \"shards\": [\n";
+  for (std::size_t index = 0; index < manifest.shards.size(); ++index) {
+    const auto& shard = manifest.shards[index];
+    output << "    {\n"
+           << "      \"edge_count\": " << shard.edge_count << ",\n"
+           << "      \"file\": " << Json(shard.file).dump() << ",\n"
+           << "      \"vertex_begin\": " << shard.vertex_begin << ",\n"
+           << "      \"vertex_end\": " << shard.vertex_end << "\n"
+           << "    }" << (index + 1U == manifest.shards.size() ? "\n" : ",\n");
+  }
+  output << "  ],\n"
+         << "  \"version\": " << manifest.version << ",\n"
+         << "  \"vertex_count\": " << manifest.vertex_count << "\n"
+         << "}\n";
   if (!output) {
     throw std::runtime_error("cannot write manifest: " + path.string());
   }
