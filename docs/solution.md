@@ -86,7 +86,5 @@ $$
 
 ## Источники
 
-- [Л Пейдж, С Брин, Р Мотвани и Т Виноград — описание PageRank](https://research.google/pubs/the-pagerank-citation-ranking-bringing-order-to-the-web/)
-- [А Кюрола, Г Блеллох и К Гестрин — система GraphChi](https://www.usenix.org/conference/osdi12/technical-sessions/presentation/kyrola)
-- [А Рой и соавторы — система X-Stream](https://doi.org/10.1145/2517349.2522740)
-- [Алгоритмы LDBC Graphalytics](https://ldbcouncil.org/benchmarks/graphalytics/algorithms/)
+- [Краткое описание PageRank](https://ru.wikipedia.org/wiki/PageRank)
+- [Проверочные данные PageRank в LDBC Graphalytics](https://github.com/ldbc/ldbc_graphalytics/tree/main/graphalytics-validation/src/main/resources/validation-graphs/pr)

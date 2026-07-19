@@ -1,36 +1,51 @@
-# Internal graph format v1
+# Внутренний формат графа
 
-The preprocessing command converts CSV or SNAP-style edge lists into a static,
-destination-sharded pull representation. The graph directory is considered
-valid only after `manifest.json` has been written.
+Этот файл описывает первую версию двоичного формата
 
-## Platform
+Она рассчитана на Linux x64 с порядком байтов от младшего к старшему
 
-Version 1 targets Linux on little-endian x86-64. Integer files are raw
-little-endian arrays. All record sizes are asserted at compile time.
+## Состав каталога
 
-## Files
+- `manifest.json` — описание графа и частей с рёбрами
+- `vertices.bin` — исходные идентификаторы вершин в порядке внутренних номеров
+- `outdegrees.bin` — исходящие степени вершин
+- `shard-NNNNN.bin` — рёбра одного диапазона конечных вершин
 
-- `manifest.json`: version, counts, source path, and ordered shard metadata.
-- `vertices.bin`: dense-ID order array of signed 32-bit original vertex IDs.
-- `outdegrees.bin`: dense-ID order array of unsigned 32-bit outdegrees.
-- `shard-NNNNN.bin`: sorted `DiskEdge` records owned by one destination range.
+Готовым считается только каталог с корректным `manifest.json` и файлами ожидаемого размера
 
-Each shard record is exactly eight bytes:
+## Вершины
+
+`vertices.bin` состоит из значений `int32`
+
+Позиция значения в файле является внутренним номером вершины
+
+Исходные идентификаторы отсортированы по возрастанию, поэтому результат можно записать без дополнительной сортировки
+
+`outdegrees.bin` содержит значения `uint32` в том же порядке
+
+Оба файла должны занимать ровно `4 * V` байт
+
+## Рёбра
+
+Одна запись занимает восемь байт
 
 ```text
-uint32 little-endian destination
-uint32 little-endian source
+uint32 destination
+uint32 source
 ```
 
-Records are sorted lexicographically by `(destination, source)`. Shard vertex
-ranges are disjoint, contiguous, and cover `[0, vertex_count)`. This ownership
-rule lets PageRank workers write separate `next_rank` ranges without atomics.
+Сначала идёт внутренняя конечная вершина, затем исходная
 
-## Vertex semantics
+Записи отсортированы по паре `(destination, source)`
 
-Without a separate vertex file, the vertex set is the union of all edge
-endpoints. Original signed int32 identifiers are sorted and mapped to dense IDs
-in `[0, vertex_count)`. Duplicate edges are removed during the final merge;
-self-loops are retained.
+Диапазоны конечных вершин у файлов не пересекаются и вместе покрывают `[0, V)`
 
+Благодаря этому разные потоки не записывают ранг одной вершины одновременно
+
+Повторные рёбра удаляются во время подготовки, а петли сохраняются
+
+## Множество вершин
+
+Отдельного входного списка вершин пока нет
+
+Множество вершин равно объединению концов всех рёбер, поэтому изолированную вершину таким входом задать нельзя
